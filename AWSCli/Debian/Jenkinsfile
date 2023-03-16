@@ -1,0 +1,253 @@
+def JOBID='AWSCli' // Debian 10
+/**
+    ToDo: https://www.nops.io/low-traffic-aws-ec2-instances/
+ *  Debian10(Buster)
+    ref: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+ **/
+import groovy.transform.Field
+@Field def OSCODE= 'buster'
+@Field def OSNAME= 'debian'
+
+properties([
+    parameters([
+        booleanParam(name: 'dryRun', defaultValue: false),
+        booleanParam(name: 'doClean', defaultValue: false),
+        string(name: 'sshURI', trim: true, defaultValue: ''),
+        string(name: 'CREDID', trim: true, defaultValue: "lxc_skyap", description: ''),
+        choice(name: 'REGION', choices: ['ap-northeast-3', 'us-west-2', 'us-west-1'], description: 'Region'),
+        choice(name: 'TYPES', choices: ['t2.micro', 't2.medium', 't2.large', 't2.xlarge'], description: 'https://aws.amazon.com/ec2/instance-types/'),
+        string(name: 'VM_NAME', trim: true, defaultValue: '', description: '如不給就是: deb-NUMBER'),
+    ])
+])
+
+
+def CIEMAIL= "jack@click-ap.com"
+
+// Deal wiht sshURI
+def sshUsername= sshURI.contains('@') ? sshURI.tokenize("@")[0] : 'skyap'
+def _remoteIP= sshURI.contains('@') ? sshURI.tokenize("@")[1] : sshURI
+def remoteIP= _remoteIP.tokenize(":")[0]
+def sshPort= _remoteIP.tokenize(":")[1]?.trim() ? _remoteIP.tokenize(":")[1].toInteger() : 22
+sshPort= sshPort.toInteger()
+
+if (!remoteIP?.trim()) {
+    throw new Exception("The remoteIP is null or empty!")
+}
+
+dryRun= Boolean.valueOf(dryRun)
+def boolDryRun= dryRun ? '✓':'X'
+doClean= Boolean.valueOf(doClean)
+def boolClean= doClean ? '✓':'X'
+
+if(!VM_NAME?.trim()) {
+    VM_NAME= "${JOB_NAME}-${BUILD_NUMBER}"
+}
+
+def isDownStream= getIsUpstreamCause()
+def UPJobName= getUpstreamJobName()
+
+echo """
+JOB_NAME(BASE): ${JOB_NAME}(${JOB_URL}
+---------------------------
+     dryRun:  (${boolDryRun})
+    doClean:  ${boolClean}(${doClean})
+     sshURI:  ${sshUsername}@${remoteIP}:${sshPort}
+     CREDID:  ${CREDID}
+ DownStream?  ${isDownStream}(${UPJobName})
+---------------------------
+     REGION:  ${REGION}
+      TYPES:  ${TYPES}
+    VM_NAME:  ${VM_NAME}
+---------------------------
+"""
+
+def remote = [name: "debian10", host: "${remoteIP}", port: sshPort, allowAnyHosts: true]
+def cmdResult, props
+node ('master') {
+    stage('Ramp up') {
+        if (doClean ) {
+            cleanWs()
+        }
+        //checkout scm
+        withCredentials([sshUserPrivateKey(credentialsId: CREDID, usernameVariable: 'userName', keyFileVariable: 'keyFile')]) {
+            remote.user = (sshUsername?.trim()) ? sshUsername : userName
+            remote.identityFile = keyFile
+            
+            sshCommand remote: remote, dryRun: dryRun, command: """
+                { 
+                    aws --version
+                } || {
+                    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                    unzip awscliv2.zip
+                    sudo ./aws/install
+                }
+                mkdir -p ~/.aws
+            """
+
+            // Time Zone
+            // # sudo dpkg-reconfigure tzdata
+            sshCommand remote: remote, dryRun: dryRun, command: """
+                if ! grep -q 'Asia/Taipei' /etc/timezone; then
+                    echo 'Asia/Taipei' | sudo tee /etc/timezone
+                    sudo timedatectl set-timezone Asia/Taipei
+                fi
+            """
+        }
+    }
+
+    def VPCID
+    stage('Get MetaData') {
+        withCredentials([sshUserPrivateKey(credentialsId: CREDID, usernameVariable: 'userName', keyFileVariable: 'keyFile')]) {
+            remote.user = (sshUsername?.trim()) ? sshUsername : userName
+            remote.identityFile = keyFile
+            cmdResult = sshCommand remote: remote, dryRun: false, command: """
+                aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --vpc-ids
+            """
+            if (!cmdResult?.trim()) {
+            }
+            props = readJSON text: cmdResult
+            VPCID= props['Vpcs'][0]['VpcId']
+        }
+        println VPCID
+    }
+
+    stage('Provision') {
+        def SGID, IID, PublicIpAddress
+        withCredentials([sshUserPrivateKey(credentialsId: CREDID, usernameVariable: 'userName', keyFileVariable: 'keyFile')]) {
+            remote.user = (sshUsername?.trim()) ? sshUsername : userName
+            remote.identityFile = keyFile
+            
+            
+            def imageId= "ami-0e44d929367d23d2a"
+            imageId = "ami-0a442263b7668f379"
+            imageId = "ami-0e44d929367d23d2a"
+            imageId = "ami-09a41e26df464c548" // us-east-1
+            imageId = "ami-0024cc9cb42261ace" // ap-southeast-1
+            // aws ec2 describe-images --filters Name=name,Values=debian-11-amd64-202207*
+            // ref : https://serverfault.com/questions/816412/filtering-ami-by-name-using-aws-cli
+            // aws ec2 run-instances --image-id ami-0a442263b7668f379 --count 1 --instance-type t2.micro --key-name prod-Tokyo-key-001
+            cmdResult= sshCommand remote: remote, dryRun: dryRun, command: """
+                aws ec2 run-instances --image-id ${imageId} --count 1 --instance-type ${TYPES} --key-name prod-Tokyo-key-001 --tag-specifications 'ResourceType=instance, Tags=[{Key=Name,Value=${VM_NAME}}]'
+                # --security-group-ids sg-903004f8 --subnet-id subnet-6e7f829e
+            """
+            props = readJSON text: cmdResult
+            SGID= props['Instances'][0]['NetworkInterfaces']['Groups'][0]['GroupId']
+            println SGID
+            IId= props['Instances'][0]['InstanceId']
+            // not working aws ec2 authorize-security-group-ingress --group-id sg-0036c287599ba9dd3 --protocol tcp --port 443
+            // key word: aws cli add ingress rule to security group
+            // aws ec2 authorize-security-group-ingress --group-name "default" --protocol tcp --port 22   --cidr $IP/32 --profile class --output text
+            // aws ec2 authorize-security-group-ingress --group-name "default" --protocol tcp --port 3389 --cidr 0.0.0.0/0 --profile class --output text
+            // ref: https://stackoverflow.com/questions/32918227/how-could-i-add-current-pc-ip-into-security-group-with-aws-cli
+            sshCommand remote: remote, dryRun: dryRun, command: """
+                { 
+                    aws ec2 authorize-security-group-ingress --group-name "default" --protocol tcp --port 22 --cidr 0.0.0.0/0
+                } || {
+                    echo \$?
+                }
+            """
+            // Get SGID= aws ec2 describe-security-groups --filters Name=vpc-id,Values=vpc-010f85cea684cb800 Name=group-name,Values=default --query "SecurityGroups[*].{GroupName:GroupName,GroupId:GroupId}"
+
+            // Get IP Address
+            // aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" "Name=instance-id,Values=i-0d7daf5afbb97a285" --query 'Reservations[*].Instances[*].[PublicIpAddress]'
+            def getFile = false
+            while ({
+                cmdResult= sshCommand remote: remote, dryRun: dryRun, command: """
+                    aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" "Name=instance-id,Values=${IId}" --query 'Reservations[*].Instances[*].[PublicIpAddress]'
+                """
+                if(cmdResult?.trim()) {
+                    props = readJSON text: cmdResult
+                    try {
+                        PublicIpAddress= props[0][0][0]
+                        getFile=true
+                    }
+                    catch(e) {
+                        getFile=false
+                        sleep 2
+                    }
+                }
+            !getFile
+            }()) continue            
+            println "${IId} Public Ip Address: ${PublicIpAddress}"
+        }
+        env.NewVMIP= PublicIpAddress
+        env.NewSSHUSER= 'admin'
+        env.VM_NAME= VM_NAME
+    }
+
+}
+
+@NonCPS
+def getOSCode(prettyName) {
+    def _os, _ver, _oscode = 'UNKNOW'
+    // def regex= /\W(\w*)\s[a-z_A-Z\/]*\s([0-9]{1,2}).*/
+    // def regex= /\W(\w*)\s([a-z_A-Z\/]*|[0-9]{1,2}\.[0-9]{1,2}\.[0-9]+)\s([0-9]{1,2}|\w).*/
+    def regex= /[\"]?(\w*)\s([a-z_A-Z\/]*|\d+\.?\d+\.?\d+)\s([0-9]{1,2}|\w).*/
+    // PRETTY_NAME="Ubuntu 16.04.7 LTS"
+    // PRETTY_NAME="Debian GNU/Linux 10 (buster)"
+    // PRETTY_NAME="Ubuntu 18.04.5 LTS"
+    // PRETTY_NAME="CentOS Linux 7 (Core)"
+    def matcher = ( prettyName =~ regex )
+    if (matcher.matches()) {
+        echo matcher[0].dump()
+        _os = matcher[0][1]
+        m1 = matcher[0][2]
+        m2 = matcher[0][3]
+    }
+    switch(_os) {
+    case "CentOS":
+        OSNAME= 'centos'
+        if (m2 == '7') {
+            _oscode= 'centos7'
+        }
+    case "Debian":
+        OSNAME= 'debian'
+        if (m2 == '10') {
+            _oscode= 'buster'
+        } else if (m2 == '11') {
+            _oscode= 'bullseye'
+        }
+        break; 
+    case "Ubuntu":
+        OSNAME= 'ubuntu'
+        if (m1.startsWith('20')) {
+            _oscode= 'focal'
+        }
+        if (m1.startsWith('18')) {
+            _oscode= 'bionic'
+        }
+        if (m1.startsWith('16')) {
+            _oscode= 'xenial'
+        }
+        break;
+    default:
+        println("The OS is unknown");
+        break;
+    }
+    return _oscode
+}
+
+def getIsUpstreamCause() {
+    def upstream= currentBuild.rawBuild.getCause(hudson.model.Cause$UpstreamCause)
+    //echo upstream?.shortDescription
+    //echo Objects.isNull(upstream) ? 'true' : 'false'
+    def upstreamNull= Objects.isNull(upstream)
+    def isUpstreamCause= !upstreamNull
+    return isUpstreamCause
+}
+
+def getUpstreamJobName() {
+    def upstream= currentBuild.rawBuild.getCause(hudson.model.Cause$UpstreamCause)
+    //echo upstream?.shortDescription
+    //echo Objects.isNull(upstream) ? 'true' : 'false'
+    def upstreamNull= Objects.isNull(upstream)
+    def isUpstreamCause= !upstreamNull
+    if(!upstreamNull) {
+        def _up= upstream.toString()
+        def jobName= _up.contains('/') ? _up.tokenize("/")[1] : ''
+        //println upstream.getClass()
+        return jobName
+    }
+    //return isUpstreamCause
+    return ''
+}

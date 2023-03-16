@@ -1,0 +1,178 @@
+def JOBID= 'AWSCli'
+
+import groovy.transform.Field
+@Field def REGION = 'ap-northeast-1'
+properties([
+    parameters([
+        string(name: 'EC2', trim: true, defaultValue: "ec2-user@10.193.18.80 ap-northeast-1 prod-Tokyo-key-001 sg-0bbd4cb18dd132a71"),
+
+        choice(name: 'TYPES', choices: ['t2.micro', 't2.medium', 't2.large', 't2.xlarge'], description: 'https://aws.amazon.com/ec2/instance-types/'),
+        choice(name: 'DISKSIZE', choices: ['16', '32', '64', '128']),
+        string(name: 'IMAGEID', trim: true, defaultValue: 'ami-06ee4e2261a4dc5c3'),
+        string(name: 'VM_NAME', trim: true, defaultValue: ''),
+        choice(name: 'IPTYPE', choices: ['PrivateIpAddress', 'PublicIpAddress']),
+
+        string(name: 'AccessKeyId', trim: true, defaultValue: ''),
+        string(name: 'SecretAccessKey', trim: true, defaultValue: ''), 
+        string(name: 'SUBNETID', trim: true, defaultValue: ''),
+        string(name: 'SECURITYGROUP', trim: true, defaultValue: '')
+    ])
+])
+/*
+    Get Instance Type Offerings
+        aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=instance-type,Values=c5.2xlarge --region us-east-1
+    Change Hostname:
+        sudo hostnamectl set-hostname <new host name>
+    Tutorial:
+        https://aws.amazon.com/premiumsupport/knowledge-center/iam-assume-role-cli/
+*/
+
+(ec2URI, Region, KeyName, SecurityGroup22) = EC2.trim().split(' ')
+sshURI= org.apache.commons.lang.StringEscapeUtils.unescapeHtml(ec2URI)
+def CREDID= KeyName.trim()
+if (! SECURITYGROUP?.trim()) {
+    SECURITYGROUP= SecurityGroup22
+}
+
+// Deal wiht sshURI
+def sshUsername= sshURI.contains('@') ? sshURI.tokenize("@")[0] : 'skyap'
+def _remoteIP= sshURI.contains('@') ? sshURI.tokenize("@")[1] : sshURI
+def remoteIP= _remoteIP.tokenize(":")[0]
+def sshPort= _remoteIP.tokenize(":")[1]?.trim() ? _remoteIP.tokenize(":")[1].toInteger() : 22
+
+if (!remoteIP?.trim()) {
+    error "The remoteIP is null or empty!"
+}
+
+//if (!KEYNAME?.trim()) {
+//    error "The KEYNAME is null or empty!"
+//}
+
+dryRun= Boolean.valueOf(false)
+def boolDryRun= dryRun ? '?':'X'
+
+if(!VM_NAME?.trim()) {
+    VM_NAME= "${JOB_NAME}-${BUILD_NUMBER}"
+}
+
+def remote = [name: "jenkins", host: "${remoteIP}", port: sshPort, allowAnyHosts: true]
+def cmdResult, props
+node ('master') {
+    stage('Ramp up') {
+        cleanWs()
+        withCredentials([sshUserPrivateKey(credentialsId: CREDID, usernameVariable: 'userName', keyFileVariable: 'keyFile')]) {
+            remote.user = (sshUsername?.trim()) ? sshUsername : userName
+            remote.identityFile = keyFile
+            
+            sshCommand remote: remote, dryRun: dryRun, command: """
+                mkdir -p ~/.aws
+                { 
+                    aws --version
+                    sudo ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+                    # https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+                } || {
+                    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                    unzip awscliv2.zip
+                    sudo ./aws/install
+                    if [ -z "${AccessKeyId}" ]; then
+                        aws configure set aws_access_key_id ${AccessKeyId}
+                        aws configure set aws_secret_access_key ${SecretAccessKey}
+                    fi
+                    if [ -z "${Region}" ]; then
+                        aws configure set region ${Region}
+                        aws configure set output json
+                    fi
+                    # check AWS account
+                    aws sts get-caller-identity
+                    aws configure get region
+                }
+            """
+
+            // Time Zone
+            // # sudo dpkg-reconfigure tzdata
+            sshCommand remote: remote, dryRun: dryRun, command: """
+                if ! grep -q 'Asia/Taipei' /etc/timezone; then
+                    echo 'Asia/Taipei' | sudo tee /etc/timezone
+                    sudo timedatectl set-timezone Asia/Taipei
+                fi
+            """
+        }
+    }
+
+    def SUBNETS
+    stage("Default value") {
+        withCredentials([sshUserPrivateKey(credentialsId: CREDID, usernameVariable: 'userName', keyFileVariable: 'keyFile')]) {
+            remote.identityFile = keyFile
+            if (! SUBNETS?.trim()) {
+                cmdResult= sshCommand remote: remote, dryRun: dryRun, command: """
+                    aws ec2 describe-subnets --query "Subnets[?State == 'available'].[SubnetId,AvailabilityZone]"
+                """
+                def subnetIds= getSubnetIds2(cmdResult.trim(), ' ')
+                if (subnetIds.size() > 0 ) {
+                    SUBNETID= subnetIds[0]
+                }
+            }
+        }
+    }
+
+    stage("Provision") {
+        def SGID, IID, PublicIpAddress
+        withCredentials([sshUserPrivateKey(credentialsId: CREDID, usernameVariable: 'userName', keyFileVariable: 'keyFile')]) {
+            remote.identityFile = keyFile
+
+            def imageId= IMAGEID
+            // aws ec2 describe-images --filters Name=name,Values=debian-11-amd64-202207*
+            // ref : https://serverfault.com/questions/816412/filtering-ami-by-name-using-aws-cli
+            // Sample: aws ec2 run-instances --image-id ami-0a442263b7668f379 --count 1 --instance-type t2.micro --key-name ${KEYNAME}
+            def _script= "aws ec2 run-instances --image-id ${imageId} --count 1 --instance-type ${TYPES} --key-name ${KeyName}"
+            _script+= " --block-device-mapping DeviceName=/dev/xvda,Ebs={VolumeSize=${DISKSIZE}}"
+            // ref: https://stackoverflow.com/questions/53369224/how-to-launch-ec2-instance-with-custom-root-volume-ebs-size-more-than-8gb-usin
+            if (SUBNETID?.trim()) {
+                _script+= " --subnet-id ${SUBNETID}" // subnet-04cc6b10809c462fc 
+            }
+            if (SECURITYGROUP?.trim()) {
+                _script+= " --security-group-ids ${SECURITYGROUP}" //sg-0bbd4cb18dd132a71 sg-0e602d76c5a68de16 --tag-specifications 'ResourceType=instance, Tags=[{Key=Name,Value=${VM_NAME}}]'
+            }
+            _script+= " --tag-specifications 'ResourceType=instance, Tags=[{Key=Name,Value=${VM_NAME}}]'"
+            // aws ec2 run-instances --image-id ${imageId} --count 1 --instance-type ${TYPES} --key-name ${KeyName} --subnet-id subnet-04cc6b10809c462fc --security-group-ids sg-0bbd4cb18dd132a71 sg-0e602d76c5a68de16 --tag-specifications 'ResourceType=instance, Tags=[{Key=Name,Value=${VM_NAME}}]'
+            cmdResult= sshCommand remote: remote, dryRun: dryRun, command: " ${_script} "
+            props = readJSON text: cmdResult
+            SGID= props['Instances'][0]['NetworkInterfaces']['Groups'][0]['GroupId']
+            println SGID
+            IId= props['Instances'][0]['InstanceId']
+            def getPublicIP = false
+            while ({
+                cmdResult= sshCommand remote: remote, dryRun: dryRun, command: """
+                    aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" "Name=instance-id,Values=${IId}" --query 'Reservations[*].Instances[*].[${IPTYPE}]'
+                """
+                if(cmdResult?.trim()) {
+                    props = readJSON text: cmdResult
+                    try {
+                        PublicIpAddress= props[0][0][0]
+                        getPublicIP=true
+                    }
+                    catch(e) {
+                        getPublicIP=false
+                        sleep 2
+                    }
+                }
+            !getPublicIP
+            }()) continue            
+            println "${IId} Public Ip Address: ${PublicIpAddress}"
+        }
+        env.NewVMIP= PublicIpAddress
+        env.NewSSHUSER= sshUsername
+        env.VM_NAME= VM_NAME
+    }
+}
+
+def getSubnetIds2(jsonText, delimiter) {
+    def subnetIDs= []
+    def props = readJSON text: jsonText
+    def snets= props
+    for(subNet in props) {
+        subnetIDs.add(subNet[0])
+    }
+    println subnetIDs.join(delimiter) //',' or ' '
+    return subnetIDs
+}
